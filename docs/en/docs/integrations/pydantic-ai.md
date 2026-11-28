@@ -164,10 +164,13 @@ result = await agent.run(
 
 `PC_GATEWAY_KEY` holds the gateway's `PC_GATEWAY_API_KEY` value. The header names the conversation: use one stable ID
 per conversation, of 1 to 256 visible ASCII characters, and never one ID for every conversation. A combined deployment
-(`PC_GATEWAY_CORE_UDS`) injects by default only into requests that carry this header or another recognized session
-header, prepares once per user message, and replays that context to the tool-loop steps of the run. An application that
-cannot send the header needs `PC_GATEWAY_INJECTION=on`, which prepares each request separately; a standalone gateway
-(`PC_GATEWAY_CORE_BASE`) injects only with that setting. See [Gateway context
+(`PC_GATEWAY_CORE_UDS`) prepares once per user message of a conversation and replays that context to the tool-loop steps
+of the run. Without the header, it infers the conversation from the opening of the request: Pydantic AI sends the full
+message history on every request unless `openai_previous_response_id` or `openai_conversation_id` is set, and a history
+that opens with system messages and a user prompt qualifies. The header still keeps apart conversations that open the
+same way, and gives capture and prefix extraction a conversation identity that stays the same across gateway restarts;
+an inferred ID is local to the gateway process and serves only preparation replay. A standalone gateway
+(`PC_GATEWAY_CORE_BASE`) injects only with `PC_GATEWAY_INJECTION=on`. See [Gateway context
 injection](../operate/deploy-server.md#gateway-context-injection).
 
 Start behind the gateway with new message history. History from runs with the capability keeps the recalled context as a
@@ -186,11 +189,15 @@ Configure Core and the gateway as well:
   enforcing rules: an enforcing Core withholds a Responses request without `store: false` or without an output limit
   within the target's token budget, and the gateway returns HTTP 400. Restart the gateway after changing the mode,
   because it discovers the mode at startup.
-- Core needs a target for the profile that `PC_GATEWAY_UPSTREAM_PROFILE` names (`default` unless set), in every privacy
-  mode. Without one, Core withholds each request with `target_unsupported` and the gateway returns HTTP 400. See
-  [Configure a supported target](../operate/inference-protection.md#configure-a-supported-target).
-- Set `PC_GATEWAY_UPSTREAM_URL_RESPONSES` and `PC_GATEWAY_UPSTREAM_API_KEY_RESPONSES` to the provider's Responses
-  endpoint and key, `PC_GATEWAY_SEDIMENT=on`, and `PC_GATEWAY_CORE_TOKEN` when Core enforces authentication.
+- For this Responses route, set `PC_GATEWAY_UPSTREAM_PROFILE_RESPONSES` to a Core target whose endpoint,
+  `openai-responses` protocol and model match the request. Without it, the route returns HTTP 501
+  `responses_route_disabled`. Set `PC_GATEWAY_UPSTREAM_API_KEY_RESPONSES` to the provider key and
+  `PC_GATEWAY_SEDIMENT=on`. Do not set `PC_GATEWAY_UPSTREAM_URL*`; these legacy variables prevent startup.
+- Set a nonempty `PC_GATEWAY_API_KEY` even on loopback, and set `PC_GATEWAY_CORE_TOKEN` to an authenticated service
+  identity. Core access control must be `enforced`; grant it `gateway.user` on the selected Scope and `server.observer`
+  on the Server resource for `POWERCONTEXT_SERVER_ACCESS_DEPLOYMENT_ID` (default `powercontext`). Because this guide
+  enables capture, grant `scope.contributor` (which includes `scope.read`) rather than `scope.viewer`.
+  See [Gateway authentication and target requirements](../operate/deploy-server.md#gateway-model-destination).
 - The gateway prepares and captures every conversation in the one Scope that `PC_GATEWAY_DEFAULT_SCOPE` names. Set it to
   the Scope the toolset resolves, so that the tools search and write the Memory the gateway recalls.
 

@@ -144,9 +144,11 @@ def gateway_agent(thread_id: str):
 
 `PC_GATEWAY_KEY` 保存 gateway 的 `PC_GATEWAY_API_KEY` 值。这个请求头标识会话：每个会话使用一个稳定的 ID，例如
 checkpointer 的 thread ID，长度为 1～256 个可见 ASCII 字符；不要让所有会话共用一个 ID。组合部署（`PC_GATEWAY_CORE_UDS`）
-默认只向带有这个请求头或其他可识别会话头的请求注入上下文，每条用户消息准备一次，并把结果重放给这条消息的工具循环步骤。
-无法发送这个请求头的应用需要设置 `PC_GATEWAY_INJECTION=on`，此时 gateway 为每个请求分别准备；独立运行的
-gateway（`PC_GATEWAY_CORE_BASE`）只有设置了这一项才会注入。
+在一个会话中每条用户消息准备一次，并把结果重放给这条消息的工具循环步骤。没有这个请求头时，它根据请求的历史开头推导会话：
+除非设置 `use_previous_response_id=True`，`ChatOpenAI` 每次调用都发送 thread 的完整历史；
+以 system 消息和一条用户消息开头的历史即可推导。请求头仍能区分开头相同的会话，
+并为采集和前缀提取提供在 gateway 重启后保持不变的会话标识；推导出的 ID 仅在当前 gateway 进程内用于重放准备结果。
+独立运行的 gateway（`PC_GATEWAY_CORE_BASE`）只有设置 `PC_GATEWAY_INJECTION=on` 才会注入。
 见[网关上下文注入](../operate/deploy-server.md#网关上下文注入)。
 
 请使用 Responses 路由（`use_responses_api=True`）。在这个路由上，gateway 以非流式方式调用模型，采集通过检查的响应，
@@ -158,11 +160,15 @@ gateway（`PC_GATEWAY_CORE_BASE`）只有设置了这一项才会注入。
 - 除非每个请求都满足 enforcing 规则，否则请让 Core 运行在非 enforcing 隐私模式（`disabled`、`shadow` 或 `advisory`）：
   enforcing 模式的 Core 会暂缓没有 `store: false`、或没有不超过目标 token 预算的输出上限的 Responses 请求，gateway 返回
   HTTP 400。gateway 在启动时发现 Core 的模式，修改模式后请重启 gateway。
-- 任何隐私模式下，Core 都需要为 `PC_GATEWAY_UPSTREAM_PROFILE` 指定的 profile（未设置时为 `default`）配置目标。
-  没有目标时，Core 以 `target_unsupported` 暂缓每个请求，gateway 返回 HTTP 400。
-  见[配置受支持的目标](../operate/inference-protection.md#配置受支持的目标)。
-- 把 `PC_GATEWAY_UPSTREAM_URL_RESPONSES` 和 `PC_GATEWAY_UPSTREAM_API_KEY_RESPONSES` 设为供应商的 Responses 端点和密钥，
-  设置 `PC_GATEWAY_SEDIMENT=on`；Core 启用鉴权时还要设置 `PC_GATEWAY_CORE_TOKEN`。
+- 此处使用 Responses 路由，应将 `PC_GATEWAY_UPSTREAM_PROFILE_RESPONSES` 设为 Core 中 endpoint、`openai-responses`
+  协议和模型均匹配的 target profile。未设置时该路由返回 HTTP 501 `responses_route_disabled`。
+  将 `PC_GATEWAY_UPSTREAM_API_KEY_RESPONSES` 设为该目标的服务商 Key，并设置 `PC_GATEWAY_SEDIMENT=on`。
+  不要设置 `PC_GATEWAY_UPSTREAM_URL*`；这些旧变量会导致启动失败。
+- 即使监听回环地址也必须设置非空 `PC_GATEWAY_API_KEY`，并将 `PC_GATEWAY_CORE_TOKEN` 设为已认证的服务身份。
+  Core 访问控制必须为 `enforced`；在所选 Scope 上授予 `gateway.user`，并在 `POWERCONTEXT_SERVER_ACCESS_DEPLOYMENT_ID`
+  对应的 Server resource 上授予 `server.observer`（默认 deployment ID 为 `powercontext`）。本指南开启了采集，
+  因此还要授予 `scope.contributor`（包含 `scope.read`）来替代 `scope.viewer`。
+  详见[Gateway 认证与目标要求](../operate/deploy-server.md#网关模型目标)。
 - gateway 在 `PC_GATEWAY_DEFAULT_SCOPE` 指定的同一个 Scope 中准备和采集所有会话。请把它设为 middleware 使用过的 Scope，
   使 gateway 能召回之前采集的 Memory。
 

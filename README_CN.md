@@ -73,6 +73,7 @@
 ### 可追溯与可管控
 
 - **有据可查：** 每条记忆都能追溯到来源证据和精确版本，并可定位到来源中的具体位置。
+- **任务结果：** Claude Code、Codex 和 OpenCode 每轮都会收到指引，在任务实际完成或明确中断时记录证据。
 - **改动经过审核：** 生成的经验和技能经审核后才会被召回；Dream 的修订由你批准后生效；过时的记忆可以停用，历史版本保留。
 - **边界清晰：** 按 Scope 隔离数据和访问权限；运行遥测不包含提示词、正文和模型响应。
 
@@ -235,7 +236,7 @@ Codex 为官方维护；其余 Agent 和 Python 框架集成为社区维护；Bu
 ## 了解更多
 
 - [核心概念](https://powercontext.oceanbase.io/zh/docs/get-started/core-concepts/) · [架构与职责边界](https://powercontext.oceanbase.io/zh/docs/workflows/architecture/) · [插件开发](https://powercontext.oceanbase.io/zh/docs/develop/plugins/)
-- [Python / HTTP / MCP 接口](https://powercontext.oceanbase.io/zh/docs/develop/interfaces/) · [部署 Server](https://powercontext.oceanbase.io/zh/docs/operate/deploy-server/)
+- [Python / HTTP / MCP 接口](https://powercontext.oceanbase.io/zh/docs/develop/interfaces/) · [部署 Server](https://powercontext.oceanbase.io/zh/docs/operate/deploy-server/) · [为每个 Gateway 请求选择 Scope](docs/zh/docs/operate/deploy-server.md#gateway-请求-scope)
 - [Token 评测报告](docs/benchmarks/token-savings/README_CN.md) · [博客](https://powercontext.oceanbase.io/zh/blog/)
 
 ## 社区

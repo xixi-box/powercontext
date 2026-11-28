@@ -15,19 +15,24 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import importlib.util
 import json
 import logging
+import os
 import re
 import sys
 import threading
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
 from jsonschema import ValidationError, validate
+
+from tests.git_worktree_support import check_worktree_fallback, make_git_layout
 
 HERMES_ROOT = Path(__file__).parents[2] / "integrations" / "hermes"
 _HERMES_MODULE_NAMES = (
@@ -541,6 +546,63 @@ def test_queue_prefetch_sends_nothing_and_the_next_prefetch_prepares_its_own_pro
     assert [call[1] for call in prepares] == [("scp_00000000000000000000000000", "Which database does staging use?")]
 
 
+@pytest.mark.parametrize("source", ["config_file", "environment"])
+def test_prompt_recall_off_prepares_nothing_and_drops_the_prepare_tool(tmp_path, hermes_modules, monkeypatch, source):
+    provider_module, _cli_module = hermes_modules
+    default_client = FakeClient()
+    default = provider_module.PowerContextMemoryProvider(client_factory=lambda _config: default_client)
+    default.initialize("session-0", hermes_home=str(tmp_path / "default"), agent_identity="coder")
+    try:
+        # By default the provider prepares each prompt and offers the prepare tool.
+        assert "remembered project context" in default.prefetch("Which database does staging use?")
+        assert "powercontext_prepare_context" in {schema["name"] for schema in default.get_tool_schemas()}
+    finally:
+        default.shutdown()
+
+    off_home = tmp_path / "off"
+    if source == "config_file":
+        (off_home / "powercontext").mkdir(parents=True)
+        (off_home / "powercontext" / "config.json").write_text(json.dumps({"prompt_recall": False}), encoding="utf-8")
+    else:
+        monkeypatch.setenv("POWERCONTEXT_HERMES_PROMPT_RECALL", "false")
+    client = FakeClient()
+    provider = provider_module.PowerContextMemoryProvider(client_factory=lambda _config: client)
+    provider.initialize("session-1", hermes_home=str(off_home), agent_identity="coder")
+    try:
+        before = list(client.calls)
+        assert provider.prefetch("Which database does staging use?", session_id="session-1") == ""
+        provider.queue_prefetch("Which database does staging use?", session_id="session-1")
+        provider._wait_for_background()
+        assert client.calls == before
+        assert provider.recall_status() is None
+
+        names = {schema["name"] for schema in provider.get_tool_schemas()}
+        assert "powercontext_prepare_context" not in names
+        assert {"powercontext_search_memory", "powercontext_remember", "powercontext_capture_source"} <= names
+        # Hermes builds its tool routes before initialize() reads the config file, so a call is refused as well.
+        refused = json.loads(provider.handle_tool_call("powercontext_prepare_context", {"query": "staging"}))
+        assert refused == {"error": "Unknown PowerContext tool: powercontext_prepare_context"}
+        assert client.calls == before
+    finally:
+        provider.shutdown()
+
+
+def test_prompt_recall_off_keeps_turn_capture_tools_and_flush(make_provider):
+    provider, client = make_provider({"prompt_recall": False})
+    before = len(client.calls)
+
+    assert provider.prefetch("Use uv for the integration.", session_id="session-1") == ""
+    provider.sync_turn("Use uv for the integration.", "I will add a uv check.", session_id="session-1")
+    provider._wait_for_background()
+    search = json.loads(provider.handle_tool_call("powercontext_search_memory", {"query": "uv"}))
+    provider.on_session_end([])
+
+    assert search == {"mode": "fts", "hits": []}
+    calls = client.calls[before:]
+    assert [call[0] for call in calls] == ["capture_content", "search_memory", "get_capabilities", "flush_memory"]
+    assert calls[0][2]["metadata"]["kind"] == "hermes-turn"
+
+
 def test_json_config_is_loaded_from_hermes_home(tmp_path, hermes_modules):
     provider_module, _cli_module = hermes_modules
     client = FakeClient()
@@ -578,6 +640,8 @@ def test_memory_setup_schema_exposes_powercontext_configuration(hermes_modules):
     assert fields["authorization"]["env_var"] == "POWERCONTEXT_HERMES_AUTHORIZATION"
     assert fields["capture_pre_compress"]["choices"] == ["true", "false"]
     assert "capture_turns" in fields
+    assert fields["prompt_recall"]["default"] == "true"
+    assert fields["prompt_recall"]["choices"] == ["true", "false"]
     assert "flush_on_session_end" in fields
     assert fields["scope_id"]["default"] == ""
     assert "scope_binding" not in fields
@@ -1638,6 +1702,46 @@ def test_scope_resolution_uses_session_workspace_and_server_default(tmp_path, he
     assert [key["kind"] for key in client.resolved_binding_keys] == ["session", "workspace"]
     assert all(key["integration"] == "hermes" for key in client.resolved_binding_keys)
     provider.shutdown()
+
+
+def test_a_linked_worktree_resolves_to_its_checkouts_binding_until_it_has_its_own(
+    tmp_path, hermes_modules, monkeypatch
+):
+    provider_module, _cli_module = hermes_modules
+    layout = make_git_layout(tmp_path, monkeypatch)
+    client = FakeClient()
+    client.default_scope_id = "default"
+
+    @contextmanager
+    def provider_in(cwd: Path):
+        provider = provider_module.PowerContextMemoryProvider({}, client_factory=lambda _config: client)
+        provider.initialize("session-1", hermes_home=str(tmp_path / "hermes"), cwd=str(cwd))
+        try:
+            yield provider
+        finally:
+            provider.shutdown()
+
+    def command(cwd: Path, text: str) -> dict[str, Any]:
+        with provider_in(cwd) as provider:
+            return json.loads(provider.handle_slash_command(text))
+
+    # Hermes keys the working directory, so the checkout's binding applies at the same place in the worktree.
+    check_worktree_fallback(
+        checkout=layout.checkout_sub,
+        worktree=layout.worktree_sub,
+        bare_worktree=layout.bare_worktree,
+        resolve=lambda cwd: command(cwd, "scope status")["active_scope_id"],
+        bind=lambda cwd, scope_id: command(cwd, f"scope bind {scope_id}"),
+        clear=lambda cwd: command(cwd, "scope clear"),
+    )
+    with provider_in(layout.worktree_sub):
+        pass
+    # The first workspace key is still the hash of the resolved working directory, so existing bindings keep matching.
+    assert [key["external_id"] for key in client.resolved_binding_keys] == [
+        "session-1",
+        hashlib.sha256(os.fsencode(layout.worktree_sub)).hexdigest(),
+        hashlib.sha256(os.fsencode(layout.checkout_sub)).hexdigest(),
+    ]
 
 
 def test_explicit_scope_precedes_server_bindings(tmp_path, hermes_modules):

@@ -37,6 +37,7 @@ from .client import (
     PowerContextInvalidResponseError,
     PowerContextTransportError,
 )
+from .git_worktree import workspace_paths
 from .helpers import (
     CAPTURE_COVERAGE_KEY,
     capture_coverage,
@@ -121,6 +122,10 @@ _COMPATIBILITY_OR_AVAILABILITY_PATHS = frozenset({
     "/v1/capabilities",
     "/v1/context/prepare",
 })
+# A prepare result carries a checked prepared-context marker. Behind the PowerContext gateway the tool result stays
+# in the conversation, and Core rejects every later request that carries a marker the gateway did not inject, so the
+# tool is offered only while prompt recall is on.
+_PREPARE_CONTEXT_TOOL = "powercontext_prepare_context"
 _AUTOMATIC_OPERATION_PATHS = {
     "context_prepare": frozenset({"/v1/context/prepare"}),
     "capture_source": frozenset({"/v1/sources/content"}),
@@ -201,6 +206,11 @@ def _precompress_snapshot_after_capture(
         if entries[start : start + len(new_entries)] == new_entries:
             return current_fingerprints[: start + captured_count]
     return captured_fingerprints
+
+
+def _workspace_binding_key(path: str) -> dict[str, str]:
+    workspace_id = hashlib.sha256(os.fsencode(Path(path).resolve(strict=False))).hexdigest()
+    return {"integration": "hermes", "kind": "workspace", "external_id": workspace_id}
 
 
 def _definitive_rejection(error: PowerContextError) -> bool:
@@ -390,6 +400,12 @@ class PowerContextMemoryProvider(MemoryProvider):
                 "default": str(int(_DEFAULT_TIMEOUT)),
                 "type": "number",
                 "minimum": 0.1,
+            },
+            {
+                "key": "prompt_recall",
+                "description": "Prepare and inject context for each prompt",
+                "default": "true",
+                "choices": ["true", "false"],
             },
             {
                 "key": "capture_turns",
@@ -660,22 +676,27 @@ class PowerContextMemoryProvider(MemoryProvider):
                 self._accept_memory_writes = was_accepting
 
     def _scope_binding_keys(self) -> list[dict[str, str]]:
+        """Return the keys that resolution tries in order.
+
+        They are the session's, the workspace's, and, in a linked Git worktree, the same directory's in the main
+        checkout.
+        """
+
         keys = []
         if self._session_id:
             keys.append({"integration": "hermes", "kind": "session", "external_id": self._session_id})
-        workspace_id = hashlib.sha256(os.fsencode(Path(self._scope_binding_cwd).resolve(strict=False))).hexdigest()
-        keys.append({"integration": "hermes", "kind": "workspace", "external_id": workspace_id})
+        keys.extend(_workspace_binding_key(path) for path in workspace_paths(self._scope_binding_cwd, git_root=False))
         return keys
 
     def _bind_workspace_scope(self, scope_id: str) -> None:
-        response = self._client.set_scope_binding(self._scope_binding_keys()[-1], scope_id)
+        response = self._client.set_scope_binding(_workspace_binding_key(self._scope_binding_cwd), scope_id)
         if response.get("scope_id") != scope_id:
             raise InvalidScopeBindingError
         self._bound_scope_id = scope_id
         self._switch_scope(scope_id)
 
     def _clear_workspace_scope(self) -> bool:
-        response = self._client.clear_scope_binding(self._scope_binding_keys()[-1])
+        response = self._client.clear_scope_binding(_workspace_binding_key(self._scope_binding_cwd))
         cleared = response.get("cleared")
         if not isinstance(cleared, bool):
             raise InvalidScopeBindingError
@@ -852,11 +873,17 @@ class PowerContextMemoryProvider(MemoryProvider):
             raise PowerContextInvalidResponseError(error)
         return content
 
+    def _prompt_recall_enabled(self) -> bool:
+        return _as_bool(
+            _config_value(self._config, "prompt_recall", "POWERCONTEXT_HERMES_PROMPT_RECALL", True),
+            True,
+        )
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         scope_id = self._scope_id
         client = self._client
         recall_query = _automatic_recall_query(query, getattr(client, "authorization", None))
-        if not client or not recall_query or not scope_id:
+        if not client or not recall_query or not scope_id or not self._prompt_recall_enabled():
             self._last_recall = None
             self._last_recall_scope_id = ""
             return ""
@@ -1403,13 +1430,19 @@ class PowerContextMemoryProvider(MemoryProvider):
         return commands.status_command(self)
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return commands.get_tool_schemas()
+        schemas = commands.get_tool_schemas()
+        if self._prompt_recall_enabled():
+            return schemas
+        return [schema for schema in schemas if schema.get("name") != _PREPARE_CONTEXT_TOOL]
 
     @staticmethod
     def _citation_properties() -> dict[str, Any]:
         return commands.citation_properties()
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
+        # Hermes indexes tool routes before initialize() merges the config file, so refuse the call here too.
+        if tool_name == _PREPARE_CONTEXT_TOOL and not self._prompt_recall_enabled():
+            return commands.tool_error(f"Unknown PowerContext tool: {tool_name}")
         return commands.handle_tool_call(self, tool_name, args, **kwargs)
 
     def _wait_for_background(self) -> None:

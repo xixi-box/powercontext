@@ -237,20 +237,26 @@ Configure Core and the gateway as well:
 - Run Core in a non-enforcing privacy mode (`disabled`, `shadow`, or `advisory`). OpenClaw sends no `store` field to a
   custom provider, so an enforcing Core withholds each of its Responses requests and the gateway returns HTTP 400.
   Restart the gateway after changing the mode, because it discovers the mode at startup.
-- Core needs a target for the profile that `PC_GATEWAY_UPSTREAM_PROFILE` names (`default` unless set), in every privacy
-  mode. Without one, Core withholds each request with `target_unsupported` and the gateway returns HTTP 400. See
-  [Configure a supported target](../operate/inference-protection.md#configure-a-supported-target).
-- Set `PC_GATEWAY_UPSTREAM_URL_RESPONSES` and `PC_GATEWAY_UPSTREAM_API_KEY_RESPONSES` to the provider's Responses
-  endpoint and key, `PC_GATEWAY_SEDIMENT=on`, and `PC_GATEWAY_CORE_TOKEN` when Core enforces authentication.
+- For this Responses route, set `PC_GATEWAY_UPSTREAM_PROFILE_RESPONSES` to a Core target whose endpoint,
+  `openai-responses` protocol and model match the request. Without it, the route returns HTTP 501
+  `responses_route_disabled`. Set `PC_GATEWAY_UPSTREAM_API_KEY_RESPONSES` to the provider key and
+  `PC_GATEWAY_SEDIMENT=on`. Do not set `PC_GATEWAY_UPSTREAM_URL*`; these legacy variables prevent startup.
+- Set a nonempty `PC_GATEWAY_API_KEY` even on loopback, and set `PC_GATEWAY_CORE_TOKEN` to an authenticated service
+  identity. Core access control must be `enforced`; grant it `gateway.user` on the selected Scope and `server.observer`
+  on the Server resource for `POWERCONTEXT_SERVER_ACCESS_DEPLOYMENT_ID` (default `powercontext`). Because this guide
+  enables capture, grant `scope.contributor` (which includes `scope.read`) rather than `scope.viewer`.
+  See [Gateway authentication and target requirements](../operate/deploy-server.md#gateway-model-destination).
 - The gateway prepares and captures every conversation in the one Scope that `PC_GATEWAY_DEFAULT_SCOPE` names, not in
   the Scope this plugin resolves for each session or project. Set the plugin's `scopeId` and `PC_GATEWAY_DEFAULT_SCOPE`
   to the same existing Scope.
-- Set `PC_GATEWAY_INJECTION=on`. A combined deployment injects by default only into requests that carry
-  `X-PowerContext-Conversation-ID` or another recognized session header. OpenClaw 2026.8.1 sends its session headers
-  only to OpenAI's own endpoints, and a provider's `headers` are the same for every session, so no OpenClaw request
-  names a conversation. With injection on, the gateway prepares each request separately, tool-loop steps included. Do
-  not put a fixed `X-PowerContext-Conversation-ID` in the provider's `headers`, because the gateway would then treat
-  every session as one conversation.
+- OpenClaw 2026.8.1 sends its session headers only to OpenAI's own endpoints, and a provider's `headers` are the same
+  for every session, so no OpenClaw request names a conversation. A combined deployment (`PC_GATEWAY_CORE_UDS`) infers
+  it instead: on a custom provider OpenClaw sends the session's full history on every request, opening with its system
+  prompt and the first user message, so the gateway prepares once per user message and replays that context to the
+  tool-loop steps. Sessions that open with the same system prompt and first message share an inferred conversation. A
+  standalone gateway (`PC_GATEWAY_CORE_BASE`) injects only with `PC_GATEWAY_INJECTION=on`. Do not put a fixed
+  `X-PowerContext-Conversation-ID` in the provider's `headers`, because the gateway would then treat every session as
+  one conversation.
 
 See [Gateway context injection](../operate/deploy-server.md#gateway-context-injection) and [Gateway authentication
 boundaries](../operate/deploy-server.md#gateway-authentication-boundaries).

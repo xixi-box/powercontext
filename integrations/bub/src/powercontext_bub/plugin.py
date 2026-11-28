@@ -34,6 +34,7 @@ from bub import Settings, config, ensure_config, hookimpl
 from bub.envelope import content_of, field_of
 from bub.hooks.interception import LLMCallRequest, LLMCallResult, ToolCall, ToolCallResult
 from bub.prompt import UserContent, prompt_text, to_content
+from bub.tools import Tool
 from bub.turn import TurnState
 from pydantic import Field, HttpUrl, SecretStr, field_validator
 from pydantic_settings import SettingsConfigDict
@@ -41,7 +42,13 @@ from pydantic_settings import SettingsConfigDict
 from powercontext.client import InvalidResponseError, PowerContextClient, ServerResponseError, TransportError
 from powercontext.client.capture import render_capture_event
 from powercontext.client.transport_policy import ClientTransportSettings
-from powercontext.http import CaptureContentSourceRequest, FlushMemoryRequest, PrepareContextRequest, PreparedContext
+from powercontext.http import (
+    CaptureContentSourceRequest,
+    FlushMemoryRequest,
+    PrepareContextRequest,
+    PreparedContext,
+    ScopeBindingKey,
+)
 
 try:
     from powercontext.http import ContextAssembly
@@ -50,7 +57,7 @@ except ImportError:
     from types import NoneType as ContextAssembly
 
 from ._prompt_privacy import scrub_secrets
-from .scope import resolve_scope_id, workspace_binding_key
+from .scope import resolve_scope_id, workspace_binding_key, workspace_binding_keys
 
 STATE_KEY = "_powercontext"
 CONTEXT_MARKER = "PowerContext host-supplied context"
@@ -87,6 +94,9 @@ class PowerContextSettings(ClientTransportSettings, Settings):
     timeout: float = Field(default=10, gt=0)
     max_bytes: int = Field(default=8000, ge=512, le=32768)
     context_assembly: ContextAssembly | None = None
+    # Behind the PowerContext gateway, which injects context itself, Core rejects every request that carries a block
+    # the gateway did not inject, so turning this off also withholds the prepare tool, whose result stays on the tape.
+    prompt_recall: bool = True
     capture_events: bool = False
     capture_checkpoint_every: int = Field(default=5, ge=1, le=100)
     capture_max_bytes: int = Field(default=8192, ge=512, le=32768)
@@ -148,12 +158,12 @@ class PowerContextPlugin:
         self._framework = framework
         self._scope_lock = asyncio.Lock()
         self._capture_lock = asyncio.Lock()
+        self._binding_keys: dict[str | None, list[ScopeBindingKey]] = {}
 
     @hookimpl
     def load_state(self, message: Any, session_id: str) -> TurnState:
         del message, session_id
-        workspace_key = workspace_binding_key(getattr(self._framework, "workspace", None))
-        binding_keys = [workspace_key] if workspace_key is not None else []
+        binding_keys = self._workspace_binding_keys(getattr(self._framework, "workspace", None))
         return {
             STATE_KEY: {
                 "base_url": self.base_url,
@@ -216,6 +226,16 @@ class PowerContextPlugin:
         return None
 
     @hookimpl
+    def provide_tools(self) -> list[Tool]:
+        # The tools module imports this one, so import it only once both are loaded.
+        from . import tools
+
+        provided = [tools.search_memory, tools.remember_memory]
+        if self.settings.prompt_recall:
+            provided.append(tools.prepare_context)
+        return provided
+
+    @hookimpl
     def system_prompt(self, prompt: str | list[dict[str, Any]], state: TurnState) -> str:
         del prompt, state
         return GUIDANCE
@@ -223,7 +243,7 @@ class PowerContextPlugin:
     @hookimpl
     async def before_llm_call(self, request: LLMCallRequest, state: TurnState) -> LLMCallRequest | None:
         prompt = _latest_user_text(request.messages)
-        if not prompt:
+        if not prompt or not (self.settings.prompt_recall or self.settings.capture_events):
             return None
 
         scope_id = await self._scope_id(state)
@@ -244,7 +264,7 @@ class PowerContextPlugin:
                     state=state,
                 )
 
-        if any(_contains_context_marker(message) for message in request.messages):
+        if not self.settings.prompt_recall or any(_contains_context_marker(message) for message in request.messages):
             return None
 
         # A prompt Bub did not build from an inbound message, such as a subagent's, is recalled as the model sees it.
@@ -299,6 +319,18 @@ class PowerContextPlugin:
             return
         async with self._capture_lock:
             await self._flush_captured_sources(state, final=True)
+
+    def _workspace_binding_keys(self, workspace: str | Path | None) -> list[ScopeBindingKey]:
+        if self.settings.scope_id is not None:
+            # The Server resolves an explicit Scope without looking at the keys, so this asks Git nothing.
+            key = workspace_binding_key(workspace)
+            return [] if key is None else [key]
+        # Git runs once per workspace for the plugin's lifetime, not on every turn.
+        identity = None if workspace is None else str(workspace)
+        keys = self._binding_keys.get(identity)
+        if keys is None:
+            keys = self._binding_keys[identity] = workspace_binding_keys(workspace)
+        return list(keys)
 
     def _authorization(self) -> str | None:
         token = self.settings.api_token

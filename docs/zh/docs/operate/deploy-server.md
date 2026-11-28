@@ -157,13 +157,16 @@ Server 使用 UDS 时，设备上的 `powercontext source-agent` 通过 `--serve
 
 ### 网关认证边界
 
-`PC_GATEWAY_API_KEY` 仅适用于 `/gateway/v1/chat/completions` 和 `/gateway/v1/responses`。非 loopback 网关监听要求配置有效的非空 key，但该启动校验不负责其他路由的认证。组合部署（`PC_GATEWAY_CORE_UDS`）转发到 Core 的请求会保留客户端凭据，Core API、MCP 和 Dashboard 请求继续遵循 Core 自身的认证与访问控制规则。Gateway key 不授予 Core API 权限，UDS 也不能替代 Core 认证。
+`PC_GATEWAY_API_KEY` 仅适用于 `/gateway/v1/chat/completions` 和 `/gateway/v1/responses`。
+所有网关模型监听都要求有效的非空 key；该启动校验不负责其他路由的认证。
+组合部署（`PC_GATEWAY_CORE_UDS`）转发到 Core 的请求会保留客户端凭据，Core API、MCP 和 Dashboard 请求
+继续遵循 Core 自身的认证与访问控制规则。Gateway key 不授予 Core API 权限，UDS 也不能替代 Core 认证。
 
-组合部署对外开放前，须设置 `POWERCONTEXT_SERVER_ACCESS_MODE=enforced` 并配置有效的 Core 认证凭据，如上文的 UDS 示例所示。访问受保护 Core 路由的客户端必须使用 Core 凭据。 `PC_GATEWAY_CORE_TOKEN` 用于网关主动发起的 Core 调用；反向代理不会用它替换客户端凭据。
+所有 Gateway 部署（包括独立 TCP 和组合 UDS）都要求 Core 将访问控制设为 `enforced`，并为 Gateway 服务身份配置有效的认证凭据。即使推理隐私保护为 `disabled`、`shadow` 或 `advisory`，特权目标解析仍要求此配置；关闭认证/访问控制的 Core 无法批准 Gateway 模型发送。启动 Gateway 前，请设置 `POWERCONTEXT_SERVER_ACCESS_MODE=enforced` 并配置受支持的认证 Provider。访问受保护 Core 路由的客户端必须使用各自的 Core 凭据；反向代理不会用 `PC_GATEWAY_CORE_TOKEN` 替换客户端凭据。
 
 ### 网关 OAuth 订阅
 
-通过 `PC_GATEWAY_SUBSCRIPTION` 选择 `codex`、`copilot`、`grok`、`qwen`、`kimi`、`gemini` 或 `claude`。HTTP 渠道要求 `PC_GATEWAY_SUBSCRIPTION_CREDENTIALS` 指向私有凭据文件。Codex 和 Gemini 复用 CLI 登录，Grok 与 CLI 协调续期；Copilot、Qwen 和 Kimi 可创建独立设备授权。
+通过 `PC_GATEWAY_SUBSCRIPTION` 选择 `codex`、`copilot`、`grok`、`qwen`、`kimi` 或 `gemini`。Claude CLI 的内部发送不可观察，因此不支持 Core 绑定的出口。HTTP 渠道要求 `PC_GATEWAY_SUBSCRIPTION_CREDENTIALS` 指向私有凭据文件。Codex 和 Gemini 复用 CLI 登录，Grok 与 CLI 协调续期；Copilot、Qwen 和 Kimi 可创建独立设备授权。
 
 构建可执行程序、配置 Core 鉴权及批准的上游 profile 后，在 `gateway/` 下执行：
 
@@ -173,6 +176,7 @@ install -d -m 700 /path/to/private/oauth
 
 PC_GATEWAY_CORE_UDS=/path/to/core.sock \
 PC_GATEWAY_CORE_TOKEN="$POWERCONTEXT_DEPLOYMENT_TOKEN" \
+PC_GATEWAY_API_KEY="$GATEWAY_CLIENT_TOKEN" \
 PC_GATEWAY_SUBSCRIPTION=qwen \
 PC_GATEWAY_SUBSCRIPTION_CREDENTIALS=/path/to/private/oauth/qwen.json \
 PC_GATEWAY_UPSTREAM_PROFILE=approved-qwen \
@@ -181,9 +185,74 @@ PC_GATEWAY_UPSTREAM_PROFILE=approved-qwen \
 
 设备登录也支持 `copilot` 和 `kimi`，创建权限为 `0600` 的新文件，拒绝覆盖已有文件。重新授权应使用新路径并更新服务配置。HTTP 渠道只接受对应服务支持的 HTTPS endpoint，发生错误或送达不确定时不会自动重放模型请求。
 
-Gemini 关闭 Gateway 上下文注入。Claude CLI 只接受新的单轮文本请求，要求已确认的非 enforcing Core 部署。Codex 的端点无法执行输出 token 上限，因此要求该上限的 Core 策略可能暂缓请求。凭据、路由和 Core profile 配置见 [Gateway OAuth 订阅](https://github.com/oceanbase/powercontext/blob/master/gateway/SUBSCRIPTIONS.md)。
+Gemini 关闭 Gateway 上下文注入。Codex 的端点无法执行输出 token 上限，因此要求该上限的 Core 策略可能暂缓请求。只有 Core 批准服务商默认的精确地址时，订阅凭据才会发送。凭据、路由和 Core profile 配置见 [Gateway OAuth 订阅](https://github.com/oceanbase/powercontext/blob/master/gateway/SUBSCRIPTIONS.md)。
 
 不要在缺少独立递归边界时，让 Core 内部生成回经自动召回或捕获对话的 Gateway。
+
+通过 TCP 调用 Core（`PC_GATEWAY_CORE_BASE`）时，特权目标解析要求 HTTPS，或使用显式回环 IP 的 HTTP 地址，
+例如 `http://127.0.0.1:8000`、`http://[::1]:8000`。普通 HTTP 主机名地址（包括 `http://localhost:8000`）
+会被拒绝；DNS 解析不作为回环信任的依据。请改用回环 IP、HTTPS 或 `PC_GATEWAY_CORE_UDS`。
+所有 TCP Core 调用均绕过进程环境中的 HTTP 代理（如 `HTTP_PROXY`、`ALL_PROXY`），Core 地址必须可以直连，
+以免代理伪造回环地址上的特权目标批准。
+
+### 网关模型目标
+
+模型入口的可信 endpoint、协议和模型由 Core `InferenceConfig.protection.targets` 配置。
+Chat 入口选择 `PC_GATEWAY_UPSTREAM_PROFILE`；需要启用 Responses 入口时再设置
+`PC_GATEWAY_UPSTREAM_PROFILE_RESPONSES`。每个 Gateway 实例的每个入口只选择一个 profile；同一入口中
+请求其他模型会在发送前被拒绝。此前按请求选择模型的部署需要为这些模型分别配置 Gateway 实例。
+`PC_GATEWAY_CORE_TOKEN` 必须代表 Gateway 服务身份，且不能与面向客户端的必填 `PC_GATEWAY_API_KEY` 相同。
+所有 Gateway 部署（包括组合 UDS 和非 enforcing 推理隐私模式）都要求 Core 将访问控制设为 `enforced`；
+关闭认证/访问控制的 Core 无法授权模型发送。专用 Gateway 服务主体需要在客户端通过
+`X-PowerContext-Scope-ID` 选择的每个 Scope 上获得 `gateway.user`（`gateway.invoke`），而不只是
+`PC_GATEWAY_DEFAULT_SCOPE`；同时要在该部署的 Server resource 上获得 `server.observer`（`server.observe`）。
+若设置 `PC_GATEWAY_SEDIMENT=on`，还要授予 `scope.contributor`，替代 `scope.viewer`；前者同时包含准备所需的
+`scope.read` 和 Source 采集所需的 `scope.contribute`。关闭采集时，`scope.viewer`（`scope.read`）即可。
+
+引导阶段生成的 Server Token 会映射为内置管理员，并获得静态 Scope 角色。单 Token 部署仍需在客户端选择的每个
+Scope 上为它授予 `gateway.user`，而不只是默认 Scope；管理员权限覆盖 Server observer 检查，静态 Scope preset 已包含
+viewer/contributor 角色。
+托管部署建议为 Gateway 使用最小权限的专用服务身份。使用内置可写 Access Provider 时，先携带 Gateway Token 调用
+`GET /v1/access/me`
+确认 Principal，再由 Access 管理员为启用的功能创建所需绑定。将下面的 `server-token` 替换为该接口返回的
+`service` 主体；POST 请求使用 Access 管理员的凭据。Server resource 的 deployment ID 来自
+`POWERCONTEXT_SERVER_ACCESS_DEPLOYMENT_ID`，默认值为 `powercontext`：
+
+```bash
+curl --fail "$CORE_URL/v1/access/me" -H "Authorization: Bearer $PC_GATEWAY_CORE_TOKEN"
+curl --fail "$CORE_URL/v1/access/bindings/create" -H "Authorization: Bearer $ACCESS_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"subject":{"type":"service","id":"server-token"},"resource":{"type":"scope","scope_id":"<scope_id>"},"role":"gateway.user","idempotency_key":"gateway-user-<scope_id>"}'
+curl --fail "$CORE_URL/v1/access/bindings/create" -H "Authorization: Bearer $ACCESS_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"subject":{"type":"service","id":"server-token"},"resource":{"type":"server","deployment_id":"powercontext"},"role":"server.observer","idempotency_key":"gateway-observer-powercontext"}'
+
+# 仅在 PC_GATEWAY_SEDIMENT=on 时需要；它替代 scope.viewer。
+curl --fail "$CORE_URL/v1/access/bindings/create" -H "Authorization: Bearer $ACCESS_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"subject":{"type":"service","id":"server-token"},"resource":{"type":"scope","scope_id":"<scope_id>"},"role":"scope.contributor","idempotency_key":"gateway-contributor-<scope_id>"}'
+```
+
+关闭采集时，请改为创建 `scope.viewer` 绑定。若 deployment ID 不是默认值，请替换 Server resource 中的
+`powercontext`。引导 Server Token 不需要为独立服务身份说明中的 `server.observer` 或 Scope reader 绑定。
+
+非内置可写 Provider 请使用其对应的角色绑定方式。网关只使用获准 `before_send` 返回的 endpoint 和协议；Core
+不可用、缺少目标解析或协议不匹配时不发送。
+服务商凭据仍由部署方通过 `PC_GATEWAY_UPSTREAM_API_KEY_CHAT` / `PC_GATEWAY_UPSTREAM_API_KEY_RESPONSES`
+（或共用的 `PC_GATEWAY_UPSTREAM_API_KEY`）管理；此阶段 Core **不校验**账号/区域身份。权限不同的凭据身份
+不能共用一个 profile。上游传输直连 Core 批准的 endpoint，不使用进程环境中的 HTTP 代理设置
+（如 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`）；请配置可直达的 Core 批准目标。
+此前依靠这些代理连接服务商的部署，升级前必须提供直连能力；无法直连时发送会失败，不会回退使用代理。
+Core 无法批准目标时，Gateway 不会发送模型请求。
+
+特权发送请求中的模型在所有隐私模式下都必须匹配 Core profile，包括 `disabled`、`shadow` 和 `advisory`。
+关闭隐私强制检查不会授予调用其他模型的权限。
+
+### Gateway 请求 Scope
+
+向 `/gateway/v1/chat/completions` 或 `/gateway/v1/responses` 发送 `X-PowerContext-Scope-ID` 请求头，可选择召回、Core 两阶段检查和轮次采集使用的 Scope。请发送一个 Scope ID，由 1–256 个可见 ASCII 字符组成，不含逗号。请求头无效或重复时，返回 HTTP 400 和 `invalid_scope_id`。未发送该请求头时，Gateway 使用 `PC_GATEWAY_DEFAULT_SCOPE`（默认值为 `gateway:default`）。同一对话的每个请求应使用相同的 Scope。Gateway 按 Scope 和对话 ID 隔离已准备上下文的重放。
+
+请只让受信任的客户端使用 Gateway，这些客户端可以选择其 Core 凭据可访问的 Scope。Core 按配置的访问模式检查该凭据的权限。客户端或受信任的代理可以在每个请求中设置此请求头。
 
 ### 网关上下文注入
 
@@ -222,7 +291,7 @@ Rust Gateway 在启动时通过 `/v1/capabilities` 查询一次 `context_protect
 
 固定长度和 chunked/SSE provider 响应的默认缓冲上限均为 1 MiB。传输器显式设置的缓冲上限可以进一步收紧该值。输入 `payload_bytes` **不声明**输出额度。 Core 的响应配置、内容检查以及 JSON/RPC 包装仍有各自的限制，因此低于 1 MiB 的正文也可能被拒绝。 UDS 客户端的 8 MiB RPC 响应解析上限属于另一个传输方向，不是模型正文容量。
 
-响应缓冲超限时丢弃响应，返回 HTTP 400 和 `response_buffer_limit_exceeded`。不会释放 provider 正文，也不会自动重发。执行观察保留 `PossiblySent` 与 `Withheld` 终态： provider 可能已经计费。这不代表收到了完整响应，也不承诺零费用。该观察仅在进程内可见；本阶段尚未导出含尝试次数、执行终态与发送状态的可读取调用记录。 G5-A 的“可能已计费进入调用证据”仍待接入 [#2506](https://github.com/oceanbase/powercontext/pull/2506)，并通过导出记录的回归测试后才能验收。更小的完整响应仍须通过 `before_release` 才能释放。
+响应缓冲超限时丢弃响应，返回 HTTP 400 和 `response_buffer_limit_exceeded`。不会释放 provider 正文，也不会自动重发。执行观察保留 `PossiblySent` 与 `Withheld` 终态：provider 可能已经计费。这不代表收到了完整响应，也不承诺零费用。相同的生命周期事实会写入有界且不含正文的调用证据：调用记录保留尝试、终态和发送状态，生产 JSONL sink 已由 Gateway 证据验证覆盖。更小的完整响应仍须通过 `before_release` 才能释放。
 
 透明 Core/MCP 转发继续使用部署正文上限，不消耗模型输入额度。 `PC_GATEWAY_MAX_CONCURRENT`（默认 64）分别限制模型调用与 fallback 调用， 活跃的 fallback SSE 连接不会耗尽模型并发许可。两类合计最多可持有配置值两倍的许可， 不含豁免的健康探测；该设置不是进程全局并发上限。 模型许可由实际 HTTP/1 连接 owner 持有，覆盖本地响应交付及相关请求工作结束， 包括 body EOF/drop 后仍由框架缓冲的待写数据。模型响应声明 `Connection: close`； 连接正常完成表示本地完成，不证明客户端已经读取或接受响应。 原始 180 秒单调期限覆盖入口、执行和本地交付；到期直接结束连接，不另加交付或清理窗口， 部分响应可能截断，错误 JSON 仅尽力返回。框架实际观察到断连时以 `request_cancelled` 停止本地工作； 没有观察到断连的网络失联由原期限收束。交付中断保留已完成的执行终态和模型发送事实， 包括 `ReleaseAuthorized` 与 `ResponseReceived`；取消不证明 provider 回滚，也不代表可以安全重发。 进程内 `ExecutionSnapshot::local_delivery` 用 `NotStarted`、`InProgress`、`Completed` 与 `Interrupted(reason)` 表示模型内容的交付状态；拒绝和生命周期错误响应不启动模型内容交付。 它独立于执行终态，不持有响应字节或并发许可。 fallback 许可仍随响应 body 持有，直到 body drop；fallback 保留认证、keep-alive 与流式行为， 不继承模型期限或强制关闭连接策略。provider 发送与 HTTP Core RPC 使用全新 HTTP/1 连接，不复用空闲连接； UDS Core 客户端保留有界空闲连接池。Gateway 从首个停机信号起最多排空 25 秒，并将进程退出限制在 30 秒内。 `/healthz` 豁免两类并发限制。已知 Content-Length 的 fallback 超限请求在转发前返回 413。 未知长度超限会产生 body error：前缀可能已经到达 Core，转发失败时代理返回 502。 这不是成功截断，Gateway 不会通过完整缓冲 MCP 流来强制统一错误状态码。
 
@@ -251,7 +320,7 @@ Rust Gateway 在启动时通过 `/v1/capabilities` 查询一次 `context_protect
   回合不沉淀，其他请求不受影响。段数超过该上限的回合同样不沉淀。
 - **Server：** 将 `POWERCONTEXT_SERVER_INFERENCE_PREFIX_EXTRACTION_GATEWAY_URL` 设为网关的监听地址；网关要求密钥时，
   将 `POWERCONTEXT_SERVER_INFERENCE_PREFIX_EXTRACTION_GATEWAY_HEADERS` 设为
-  `{"Authorization": "Bearer <PC_GATEWAY_API_KEY>"}`。仍需配置生成模型，因为普通抽取是回退路径。
+  `{"Authorization": "Bearer <PC_GATEWAY_API_KEY>"}`。所有 Gateway 监听（包括回环地址）都必须配置 Gateway Key。仍需配置生成模型，因为普通抽取是回退路径。
 
 配置 `POWERCONTEXT_SERVER_INFERENCE_PREFIX_EXTRACTION_GATEWAY_URL` 后，Server 在没有显式指定处理模式时默认使用 `one_pass` 整理 Atomic Memory。设置 `POWERCONTEXT_SERVER_RUNTIME_ATOMIC_MEMORY_PROCESSING_MODE=per_candidate` 可保留逐候选处理，设为 `one_pass` 可显式选择单次整理。未配置回连地址的 Server 和直接使用 SDK 的配置仍默认使用 `per_candidate`。网关不会替独立启动的 Server 自动发现或配置这个地址。
 

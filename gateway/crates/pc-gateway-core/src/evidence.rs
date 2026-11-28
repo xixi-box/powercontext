@@ -36,12 +36,14 @@ impl<'a> CallRecorder<'a> {
         cancellation: RequestCancellation,
         target: &str,
         mapping: Option<UsageMapping>,
+        internal: bool,
     ) -> Self {
         let call = CallEvidence {
             call_id: observation.call_id().to_owned(),
             request_id_fingerprint: observation.request_id().map(fingerprint),
             target_fingerprint: fingerprint(target),
             usage_mapping: mapping,
+            internal,
             ..Default::default()
         };
         Self {
@@ -51,6 +53,12 @@ impl<'a> CallRecorder<'a> {
             call,
             attempt: None,
         }
+    }
+
+    /// The authoritative endpoint is not known until Core admission. Record only the
+    /// destination selected for the latest transport attempt, never a client claim.
+    pub(crate) fn set_target(&mut self, endpoint: &str) {
+        self.call.target_fingerprint = fingerprint(endpoint);
     }
 
     pub(crate) fn begin_attempt(&mut self) {

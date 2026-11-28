@@ -405,6 +405,13 @@ async def run_acceptance(  # noqa: C901 - one bounded end-to-end acceptance life
         profile_schedule_enabled=automatic_profile,
         profile_cron="* * * * *",
         topic_memory_max_workers=1,
+        # Usage recording is best-effort and uses a short default write budget.
+        # The real-provider acceptance asserts its evidence while competing with
+        # artifact processing for SQLite's single writer slot. CI runs many
+        # pytest workers, so allow several times the slowest write observed on a
+        # loaded runner and keep each flush longer than one write, as in #2648.
+        model_usage_write_timeout_seconds=20.0,
+        model_usage_flush_timeout_seconds=30.0,
     )
     config = BuiltinConfig(database=database, runtime=runtime_config, inference=inference)
     security = WorkerSecuritySpec(
@@ -504,7 +511,8 @@ async def run_acceptance(  # noqa: C901 - one bounded end-to-end acceptance life
                 raise failed("real-generation-produced-no-published-memory")
             if candidates.get("experience", 0) < 1 or candidates.get("profile", 0) != 1:
                 raise failed("real-generation-did-not-preserve-review-candidates")
-            if any(ownership.get("atomic-memory" if family == "memory" else family, 0) < 1 for family in BINDINGS):
+            # Topic Memory is Scope-owned. Its scoped Artifact heads attest publication.
+            if any(ownership.get(family, 0) < 1 for family in ("atomic-memory", "experience", "profile")):
                 raise failed("atomic-owner-attestation-contract-failed")
             if cursors["profile"] != 0 or any(
                 cursors[family] != initial_state["source_journal_position"]
@@ -528,6 +536,11 @@ async def run_acceptance(  # noqa: C901 - one bounded end-to-end acceptance life
                 if asyncio.get_running_loop().time() >= deadline:
                     raise failed("pending-review-noop-failed")
                 await asyncio.sleep(0.25)
+            # Every processor request has been acknowledged, but usage recording is
+            # an independent best-effort write. Flush accepted records before
+            # reading the evidence table so a loaded runner cannot report usage as
+            # missing merely because the recorder has not completed its write yet.
+            await contexts.flush_model_usage()
             async with contexts.database.transaction() as connection:
                 review_count = await connection.scalar(
                     select(func.count())
@@ -569,10 +582,15 @@ async def run_acceptance(  # noqa: C901 - one bounded end-to-end acceptance life
                 "memory_indexing/embedding",
                 "experience_generation/generation",
                 "topic_memory_generation/generation",
-                "topic_memory_indexing/embedding",
             ):
                 if final_state["model_requests"].get(usage_key, 0) < 1:
                     raise failed("real-model-usage-evidence-missing")
+            # Topic indexing can reuse document vectors already embedded for recall.
+            if not any(
+                final_state["model_requests"].get(usage_key, 0)
+                for usage_key in ("topic_memory_indexing/embedding", "topic_memory_recall/embedding")
+            ):
+                raise failed("real-model-usage-evidence-missing")
             prompt_evidence = await _custom_prompt_evidence(contexts, scope) if custom_prompts else {}
             search = await runtime.topic_memory.for_scope(scope).search(
                 SearchTopicMemoryRequest(query="strict configuration validation release engineering", limit=10)

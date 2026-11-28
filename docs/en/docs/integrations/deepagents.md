@@ -161,11 +161,15 @@ Without the adapter, the gateway takes over what the adapter did:
 
 `PC_GATEWAY_KEY` holds the gateway's `PC_GATEWAY_API_KEY` value. Use one stable ID per conversation, such as the
 checkpointer's thread ID, of 1 to 256 visible ASCII characters; never one ID for every conversation. A combined
-deployment (`PC_GATEWAY_CORE_UDS`) injects by default only into requests that carry this header or another recognized
-session header. It then prepares once per user message and replays that context to the tool-loop steps of the message.
-An application that cannot send the header needs `PC_GATEWAY_INJECTION=on`, which prepares each request separately; a
-standalone gateway (`PC_GATEWAY_CORE_BASE`) injects only with that setting. See [Gateway context
-injection](../operate/deploy-server.md#gateway-context-injection).
+deployment (`PC_GATEWAY_CORE_UDS`) prepares once per user message of a conversation and replays that context to the
+tool-loop steps of the message. Without the header, it infers the conversation from the opening of the request:
+`ChatOpenAI` sends the thread's full history on every call unless `use_previous_response_id=True`, and a history that
+opens with system messages and a user message qualifies. Without the header, a subagent task gets its own inferred
+conversation, because it starts a new history; a subagent with `mode: "fork"` carries the parent's history and shares
+its inferred conversation. The header still keeps apart conversations that open the same way, and gives capture and
+prefix extraction a conversation identity that stays the same across gateway restarts; an inferred ID is local to the
+gateway process and serves only preparation replay. A standalone gateway (`PC_GATEWAY_CORE_BASE`) injects only with
+`PC_GATEWAY_INJECTION=on`. See [Gateway context injection](../operate/deploy-server.md#gateway-context-injection).
 
 Use the Responses route (`use_responses_api=True`). There the gateway calls the model without streaming, captures the
 checked response, and replays it as a stream to a client that streams. On the Chat Completions route, an enforcing Core
@@ -178,11 +182,15 @@ Configure Core and the gateway as well:
   enforcing rules: an enforcing Core withholds a Responses request without `store: false` or without an output limit
   within the target's token budget, and the gateway returns HTTP 400. Restart the gateway after changing the mode,
   because it discovers the mode at startup.
-- Core needs a target for the profile that `PC_GATEWAY_UPSTREAM_PROFILE` names (`default` unless set), in every privacy
-  mode, including `disabled`. Without one, Core withholds each request with `target_unsupported` and the gateway
-  returns HTTP 400. See [Configure a supported target](../operate/inference-protection.md#configure-a-supported-target).
-- Set `PC_GATEWAY_UPSTREAM_URL_RESPONSES` and `PC_GATEWAY_UPSTREAM_API_KEY_RESPONSES` to the provider's Responses
-  endpoint and key, `PC_GATEWAY_SEDIMENT=on`, and `PC_GATEWAY_CORE_TOKEN` when Core enforces authentication.
+- For this Responses route, set `PC_GATEWAY_UPSTREAM_PROFILE_RESPONSES` to a Core target whose endpoint,
+  `openai-responses` protocol and model match the request. Without it, the route returns HTTP 501
+  `responses_route_disabled`. Set `PC_GATEWAY_UPSTREAM_API_KEY_RESPONSES` to the provider key and
+  `PC_GATEWAY_SEDIMENT=on`. Do not set `PC_GATEWAY_UPSTREAM_URL*`; these legacy variables prevent startup.
+- Set a nonempty `PC_GATEWAY_API_KEY` even on loopback, and set `PC_GATEWAY_CORE_TOKEN` to an authenticated service
+  identity. Core access control must be `enforced`; grant it `gateway.user` on the selected Scope and `server.observer`
+  on the Server resource for `POWERCONTEXT_SERVER_ACCESS_DEPLOYMENT_ID` (default `powercontext`). Because this guide
+  enables capture, grant `scope.contributor` (which includes `scope.read`) rather than `scope.viewer`.
+  See [Gateway authentication and target requirements](../operate/deploy-server.md#gateway-model-destination).
 - The gateway prepares and captures every conversation in the one Scope that `PC_GATEWAY_DEFAULT_SCOPE` names. Set it to
   the Scope the adapter used, so that the gateway recalls the Memory captured before.
 
